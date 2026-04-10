@@ -10,8 +10,23 @@ import os
 import platform
 import io
 import re
+import threading
+import uuid
 
 app = Flask(__name__)
+
+
+def _sftp_max_concurrent():
+    """同時SFTP処理の上限（有料プランのメモリに合わせて Render の環境変数で調整）。"""
+    raw = os.getenv("SFTP_MAX_CONCURRENT", "4")
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 4
+    return max(1, min(n, 32))
+
+
+_sftp_semaphore = threading.BoundedSemaphore(_sftp_max_concurrent())
 
 # ✅ Renderではcredentials.jsonではなく環境変数から
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
@@ -128,20 +143,31 @@ def upload_sftp():
         tmp_dir = "/tmp" if platform.system() != "Windows" else "./tmp"
         os.makedirs(tmp_dir, exist_ok=True)
 
-        file_path = os.path.join(tmp_dir, filename)
-        request_drive = drive_service.files().get_media(fileId=file_id)
-        with open(file_path, "wb") as f:
-            downloader = MediaIoBaseDownload(f, request_drive)
-            done = False
-            while not done:
-                status, done = downloader.next_chunk()
+        safe_name = os.path.basename(filename) or "upload.bin"
+        run_id = uuid.uuid4().hex
+        file_path = os.path.join(tmp_dir, f"{run_id}_{safe_name}")
 
-        transport = paramiko.Transport((SFTP_HOST, SFTP_PORT))
-        transport.connect(username=username, password=password)
-        sftp = paramiko.SFTPClient.from_transport(transport)
-        sftp.put(file_path, f"{SFTP_UPLOAD_PATH}/{filename}")
-        sftp.close()
-        transport.close()
+        with _sftp_semaphore:
+            try:
+                request_drive = drive_service.files().get_media(fileId=file_id)
+                with open(file_path, "wb") as f:
+                    downloader = MediaIoBaseDownload(f, request_drive)
+                    done = False
+                    while not done:
+                        status, done = downloader.next_chunk()
+
+                transport = paramiko.Transport((SFTP_HOST, SFTP_PORT))
+                transport.connect(username=username, password=password)
+                sftp = paramiko.SFTPClient.from_transport(transport)
+                sftp.put(file_path, f"{SFTP_UPLOAD_PATH}/{filename}")
+                sftp.close()
+                transport.close()
+            finally:
+                if os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                    except OSError:
+                        pass
 
         update_sheet_status(filename, "アップロード完了")
         return jsonify({"status": "success", "message": f"{filename} のアップロード成功"})
@@ -152,4 +178,8 @@ def upload_sftp():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=os.getenv("FLASK_DEBUG", "").lower() in ("1", "true", "yes"),
+    )

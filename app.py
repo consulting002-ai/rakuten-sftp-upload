@@ -22,7 +22,7 @@ app = Flask(__name__)
 _creds_cache: dict = {}
 _creds_cache_at: float = 0.0
 _creds_cache_lock = threading.Lock()
-_CREDENTIALS_CACHE_TTL = max(0, int(os.getenv("CREDENTIALS_CACHE_TTL", "300")))
+_CREDENTIALS_CACHE_TTL = max(0, int(os.getenv("CREDENTIALS_CACHE_TTL", "60")))
 
 # ✅ Renderではcredentials.jsonではなく環境変数から
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
@@ -178,8 +178,15 @@ def upload_sftp():
             transport.connect(username=username, password=password)
             sftp = paramiko.SFTPClient.from_transport(transport)
             sftp.put(file_path, f"{SFTP_UPLOAD_PATH}/{filename}")
-            sftp.close()
-            transport.close()
+            # put() 成功後のクリーンアップ。失敗してもアップロード結果に影響させない
+            try:
+                sftp.close()
+            except Exception:
+                pass
+            try:
+                transport.close()
+            except Exception:
+                pass
         finally:
             if os.path.exists(file_path):
                 try:

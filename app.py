@@ -11,6 +11,7 @@ import platform
 import io
 import re
 import threading
+import time
 import uuid
 
 app = Flask(__name__)
@@ -27,6 +28,13 @@ def _sftp_max_concurrent():
 
 
 _sftp_semaphore = threading.BoundedSemaphore(_sftp_max_concurrent())
+
+# SFTPアカウント情報のキャッシュ（Sheets APIのレート制限対策）
+# TTLは環境変数 CREDENTIALS_CACHE_TTL で変更可（秒、デフォルト300）
+_creds_cache: dict = {}
+_creds_cache_at: float = 0.0
+_creds_cache_lock = threading.Lock()
+_CREDENTIALS_CACHE_TTL = max(0, int(os.getenv("CREDENTIALS_CACHE_TTL", "300")))
 
 # ✅ Renderではcredentials.jsonではなく環境変数から
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
@@ -58,31 +66,42 @@ def normalize(text):
         return ""
     return re.sub(r"[\u3000\u200b\s\r\n]", "", text.strip().lower())
 
+def _fetch_all_credentials():
+    """Sheets APIからアカウント情報を全件取得してキャッシュを更新する。"""
+    global _creds_cache, _creds_cache_at
+    result = sheets_service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{SHEET_ACCOUNTS}!A1:C"
+    ).execute()
+    values = result.get("values", [])
+    if not values or len(values) < 2:
+        _creds_cache = {}
+        _creds_cache_at = time.monotonic()
+        return
+    headers = values[0]
+    rows = values[1:]
+    idx_account = headers.index("アカウント名")
+    idx_user = headers.index("FTP用ユーザー名")
+    idx_pass = headers.index("FTP用パスワード")
+    _creds_cache = {
+        normalize(row[idx_account]): (row[idx_user].strip(), row[idx_pass].strip())
+        for row in rows
+        if len(row) > max(idx_account, idx_user, idx_pass)
+    }
+    _creds_cache_at = time.monotonic()
+
+
 def get_sftp_credentials(account_name):
-    try:
-        result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"{SHEET_ACCOUNTS}!A1:C"
-        ).execute()
-
-        values = result.get("values", [])
-        if not values or len(values) < 2:
-            return None, None
-
-        headers = values[0]
-        rows = values[1:]
-        idx_account = headers.index("アカウント名")
-        idx_user = headers.index("FTP用ユーザー名")
-        idx_pass = headers.index("FTP用パスワード")
-
-        normalized_input = normalize(account_name)
-        for row in rows:
-            if normalize(row[idx_account]) == normalized_input:
-                return row[idx_user].strip(), row[idx_pass].strip()
-        return None, None
-    except Exception as e:
-        print(f"❌ SFTP認証取得エラー: {e}")
-        return None, None
+    global _creds_cache, _creds_cache_at
+    normalized_input = normalize(account_name)
+    with _creds_cache_lock:
+        if time.monotonic() - _creds_cache_at > _CREDENTIALS_CACHE_TTL:
+            try:
+                _fetch_all_credentials()
+            except Exception as e:
+                print(f"❌ SFTP認証取得エラー: {e}")
+                return None, None
+        return _creds_cache.get(normalized_input, (None, None))
 
 def update_sheet_status(filename, status, error_message=""):
     try:
